@@ -1,0 +1,141 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lenovo Smart Frame - Google Photos</title>
+<style>
+    body {
+        background: #101827;
+        color: #f3f4f6;
+        font-family: Arial, sans-serif;
+        max-width: 520px;
+        margin: 60px auto;
+        padding: 24px;
+        text-align: center;
+    }
+    .card {
+        background: #1e293b;
+        border-radius: 14px;
+        padding: 28px;
+    }
+    button {
+        background: #2563eb;
+        color: white;
+        border: 0;
+        border-radius: 8px;
+        padding: 15px 24px;
+        font-size: 16px;
+        cursor: pointer;
+        width: 100%;
+        margin-top: 20px;
+    }
+    button:disabled {
+        opacity: .5;
+        cursor: wait;
+    }
+    #status {
+        margin-top: 20px;
+        color: #93c5fd;
+        overflow-wrap: anywhere;
+    }
+</style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<div class="card">
+    <h2>Lenovo Smart Frame</h2>
+    <p>Connect Google Photos and select pictures for your frame.</p>
+    <button id="connect" disabled onclick="connectGoogle()">
+        Continue with Google
+    </button>
+    <p id="status">Loading Google authentication...</p>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const clientId = params.get("cid");
+const frame = params.get("frame");
+const album = params.get("album") || "Default";
+
+let tokenClient;
+
+function setStatus(message) {
+    document.getElementById("status").textContent = message;
+}
+
+function validFrameHost(host) {
+    if (!host || host.length > 100) return false;
+
+    // Only allow the local Lenovo frame server.
+    return /^(localhost|127(?:\.\d{1,3}){3}|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?::\d{1,5})?$/.test(host);
+}
+
+function initialize() {
+    if (!clientId || !clientId.endsWith(".apps.googleusercontent.com")) {
+        setStatus("Missing or invalid Google Web OAuth Client ID.");
+        return;
+    }
+
+    if (!validFrameHost(frame)) {
+        setStatus("Invalid Lenovo frame address. Please return to the frame settings.");
+        return;
+    }
+
+    if (!window.google || !google.accounts || !google.accounts.oauth2) {
+        setTimeout(initialize, 300);
+        return;
+    }
+
+    tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+        callback: handleToken,
+        error_callback: function(error) {
+            setStatus("Google sign-in error: " + (error.message || error.type || "Unknown error"));
+            document.getElementById("connect").disabled = false;
+        }
+    });
+
+    document.getElementById("connect").disabled = false;
+    setStatus("Ready. Connect your Google account to continue.");
+}
+
+function connectGoogle() {
+    if (!tokenClient) {
+        setStatus("Google authentication is not ready. Please wait.");
+        return;
+    }
+
+    document.getElementById("connect").disabled = true;
+    setStatus("Waiting for Google authorization...");
+
+    tokenClient.requestAccessToken({
+        prompt: "consent"
+    });
+}
+
+function handleToken(response) {
+    if (response.error || !response.access_token) {
+        setStatus("Google authorization failed: " + (response.error || "No access token"));
+        document.getElementById("connect").disabled = false;
+        return;
+    }
+
+    setStatus("Connected! Opening Google Photos Picker...");
+
+    const target = new URL("http://" + frame);
+    target.pathname = "/api/picker/go";
+    target.search = new URLSearchParams({
+        token: response.access_token,
+        album: album
+    }).toString();
+
+    location.replace(target.toString());
+}
+
+window.addEventListener("load", initialize);
+</script>
+</body>
+</html>
