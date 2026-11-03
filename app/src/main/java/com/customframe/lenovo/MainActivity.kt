@@ -515,21 +515,22 @@ class MainActivity : Activity() {
                     val blur = File(file.parent, file.nameWithoutExtension + "_blur.jpg")
                     var dateStr = ""
                     var locStr = ""
-                    var portrait: Boolean? = null
                     val metaStr = metaPrefs.getString(file.name, null)
                     if (metaStr != null) {
                         try {
                             val obj = JSONObject(metaStr)
                             dateStr = obj.optString("date", "")
                             locStr = obj.optString("loc", "")
-                            if (obj.has("portrait")) portrait = obj.optBoolean("portrait")
                         } catch (_: Throwable) {}
                     }
-                    FramePhoto(file, if (blur.exists()) blur else null, dateStr, locStr, portrait ?: detectIsPortrait(file))
+                    // Always inspect the actual image. Older cached metadata can contain
+                    // an incorrect portrait flag from earlier app versions.
+                    FramePhoto(file, if (blur.exists()) blur else null, dateStr, locStr, detectIsPortrait(file))
                 }.shuffled()
 
-                // Build slides: portraits are paired two-up so the wide screen is used fully
+                // Build slides: pair every two confirmed portrait images; keep landscapes full-screen.
                 val deck = mutableListOf<SlideItem>()
+                val portraitCount = loaded.count { it.isPortrait }
                 if (!pairMode) {
                     loaded.forEach { deck.add(SlideItem(it)) }
                 } else {
@@ -544,6 +545,8 @@ class MainActivity : Activity() {
                     landscapes.forEach { deck.add(SlideItem(it)) }
                 }
 
+                val pairCount = if (pairMode) portraitCount / 2 else 0
+                syncStatus = "Loaded ${loaded.size} photos; detected $portraitCount portraits; created $pairCount two-photo slides."
                 activeAlbum = safeName
                 slides = if (shuffleSlides) deck.shuffled() else deck.toList()
                 currentIndex = 0
