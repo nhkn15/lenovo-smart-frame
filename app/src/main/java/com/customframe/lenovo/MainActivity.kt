@@ -46,7 +46,6 @@ import java.util.HashMap
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.abs
 
 data class FramePhoto(
     val file: File,
@@ -82,6 +81,7 @@ class MainActivity : Activity() {
     @Volatile private var activeAlbum = "Default"
     @Volatile private var slideDurationSec = 20
     @Volatile private var pairPortraits = true
+    @Volatile private var shuffleSlides = true
     @Volatile private var sleepStartHour = 23
     @Volatile private var wakeStartHour = 7
     @Volatile private var transition = "random"
@@ -140,6 +140,7 @@ class MainActivity : Activity() {
         activeAlbum = prefs.getString("activeAlbum", "Default") ?: "Default"
         slideDurationSec = prefs.getInt("slideDurationSec", 20)
         pairPortraits = prefs.getBoolean("pairPortraitPhotos", true)
+        shuffleSlides = prefs.getBoolean("shuffleSlides", true)
         sleepStartHour = prefs.getInt("sleepStartHour", 23)
         wakeStartHour = prefs.getInt("wakeStartHour", 7)
         transition = prefs.getString("transition", "random") ?: "random"
@@ -247,7 +248,9 @@ class MainActivity : Activity() {
         bgExecutor.execute {
             try {
                 val decoded = listOfNotNull(slide.primary, slide.secondary).map { p ->
-                    Decoded(p, decodeSampledBitmap(p.blurFile ?: p.file, 320, 180), decodeSampledBitmap(p.file, 1600, 1000))
+                    val reqW = if (p.isPortrait) 1000 else 1600
+                    val reqH = if (p.isPortrait) 1600 else 1000
+                    Decoded(p, decodeSampledBitmap(p.blurFile ?: p.file, 320, 180), decodeSampledBitmap(p.file, reqW, reqH))
                 }
                 if (token != renderToken.get()) return@execute
                 mainHandler.post { if (token == renderToken.get()) showSlide(decoded) }
@@ -273,15 +276,19 @@ class MainActivity : Activity() {
             val sh = dm.heightPixels
             val paired = panes.size == 2
             val mp = LinearLayout.LayoutParams.MATCH_PARENT
+            val gapPx = if (paired) dp(14) else 0
 
-            val wrapper = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val wrapper = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setBackgroundColor(Color.BLACK)
+            }
             val anims = ArrayList<ValueAnimator>()
             panes.forEachIndexed { i, d ->
                 if (i == 1) {
-                    wrapper.addView(View(this).apply { setBackgroundColor(Color.BLACK) }, LinearLayout.LayoutParams(dp(3), mp))
+                    wrapper.addView(View(this).apply { setBackgroundColor(Color.BLACK) }, LinearLayout.LayoutParams(gapPx, mp))
                 }
                 wrapper.addView(
-                    createPane(d, if (paired) sw / 2 else sw, sh, i == 0, anims),
+                    createPane(d, if (paired) (sw - gapPx) / 2 else sw, sh, i == 0, anims, paired),
                     LinearLayout.LayoutParams(0, mp, 1f)
                 )
             }
@@ -320,7 +327,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun createPane(d: Decoded, pw: Int, ph: Int, zoomIn: Boolean, anims: MutableList<ValueAnimator>): FrameLayout {
+    private fun createPane(d: Decoded, pw: Int, ph: Int, zoomIn: Boolean, anims: MutableList<ValueAnimator>, paired: Boolean): FrameLayout {
         val mp = FrameLayout.LayoutParams.MATCH_PARENT
         val pane = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -337,26 +344,26 @@ class MainActivity : Activity() {
         }
 
         d.fg?.let { f ->
-            // Fill the pane when the photo shape is close to the pane shape, otherwise fit with blurred sides
-            val photoRatio = f.width.toFloat() / f.height.toFloat()
-            val paneRatio = pw.toFloat() / ph.toFloat()
-            val crop = abs(photoRatio / paneRatio - 1f) < 0.2f
+            // Always fit the complete original photo. The blurred layer fills any unused space.
             val iv = ImageView(this).apply {
                 setImageBitmap(f)
-                scaleType = if (crop) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
+                scaleType = ImageView.ScaleType.FIT_CENTER
             }
             pane.addView(iv, FrameLayout.LayoutParams(mp, mp))
 
-            val a = ValueAnimator.ofFloat(if (zoomIn) 1f else 1.07f, if (zoomIn) 1.07f else 1f)
-            a.duration = slideDurationSec * 1000L + 2000L
-            a.interpolator = LinearInterpolator()
-            a.addUpdateListener { v ->
-                val s = v.animatedValue as Float
-                iv.scaleX = s
-                iv.scaleY = s
+            // Paired portraits remain completely uncropped; single images get only a very subtle motion.
+            if (!paired) {
+                val a = ValueAnimator.ofFloat(1f, 1.025f)
+                a.duration = slideDurationSec * 1000L + 2000L
+                a.interpolator = LinearInterpolator()
+                a.addUpdateListener { v ->
+                    val scale = v.animatedValue as Float
+                    iv.scaleX = scale
+                    iv.scaleY = scale
+                }
+                a.start()
+                anims.add(a)
             }
-            a.start()
-            anims.add(a)
         }
 
         if (showCaption) {
@@ -436,7 +443,15 @@ class MainActivity : Activity() {
     private fun advanceSlide(delta: Int) {
         val size = slides.size
         if (size == 0) return
-        currentIndex = ((currentIndex + delta) % size + size) % size
+        if (delta > 0 && currentIndex >= size - 1 && shuffleSlides && size > 1) {
+            val previous = slides[currentIndex]
+            val nextDeck = slides.shuffled().toMutableList()
+            if (nextDeck.first() == previous) Collections.swap(nextDeck, 0, 1)
+            slides = nextDeck
+            currentIndex = 0
+        } else {
+            currentIndex = ((currentIndex + delta) % size + size) % size
+        }
         renderCurrentSlide()
     }
 
@@ -530,7 +545,7 @@ class MainActivity : Activity() {
                 }
 
                 activeAlbum = safeName
-                slides = deck.shuffled()
+                slides = if (shuffleSlides) deck.shuffled() else deck.toList()
                 currentIndex = 0
                 renderCurrentSlide()
             } catch (_: Throwable) {}
@@ -609,33 +624,54 @@ class MainActivity : Activity() {
         val metaPrefs = getSharedPreferences("photo_meta", Context.MODE_PRIVATE)
 
         var added = 0
+        var skipped = 0
+        var failed = 0
         for ((idx, item) in items.withIndex()) {
+            if (item.optString("type", "PHOTO") == "VIDEO") {
+                skipped++
+                continue
+            }
+            val id = item.optString("id", "")
+            if (id.isBlank()) {
+                failed++
+                continue
+            }
+            val targetFile = File(albumDir, "$id.jpg")
+            if (targetFile.exists() && targetFile.length() > 0L) {
+                skipped++
+                continue
+            }
+            val tempFile = File(albumDir, "$id.jpg.part")
             try {
-                if (item.optString("type", "PHOTO") == "VIDEO") continue
-                syncStatus = "Downloading ${idx + 1}/${items.size} to '$safeAlbum'..."
+                syncStatus = "Downloading ${idx + 1}/${items.size} · $added added · $failed failed..."
                 updateOnboardingText()
-                val id = item.getString("id")
                 val createTime = item.optString("createTime", "")
                 val baseUrl = item.getJSONObject("mediaFile").getString("baseUrl")
-                val targetFile = File(albumDir, "$id.jpg")
-                if (!targetFile.exists()) {
-                    val conn = (URL("$baseUrl=w1920-h1920").openConnection() as HttpURLConnection).apply {
-                        setRequestProperty("Authorization", "Bearer $accessToken")
-                        connectTimeout = 20000
-                        readTimeout = 30000
-                    }
-                    if (conn.responseCode in 200..299) {
-                        FileOutputStream(targetFile).use { fos -> conn.inputStream.copyTo(fos) }
-                        extractExifAndBlur(targetFile, createTime, metaPrefs)
-                        added++
-                    }
+                val conn = (URL("$baseUrl=w1920-h1920").openConnection() as HttpURLConnection).apply {
+                    setRequestProperty("Authorization", "Bearer $accessToken")
+                    connectTimeout = 20000
+                    readTimeout = 45000
                 }
-            } catch (_: Throwable) {}
+                try {
+                    if (conn.responseCode !in 200..299) error("Photo download HTTP ${conn.responseCode}")
+                    conn.inputStream.use { input -> FileOutputStream(tempFile).use { output -> input.copyTo(output) } }
+                    if (tempFile.length() <= 0L) error("Downloaded photo was empty")
+                    if (targetFile.exists()) targetFile.delete() // Remove a zero-byte/incomplete file from an earlier attempt.
+                    if (!tempFile.renameTo(targetFile)) error("Could not finalize downloaded photo")
+                    extractExifAndBlur(targetFile, createTime, metaPrefs)
+                    added++
+                } finally {
+                    conn.disconnect()
+                }
+            } catch (_: Throwable) {
+                failed++
+                tempFile.delete()
+            }
         }
 
         try { httpJsonRequest("https://photospicker.googleapis.com/v1/sessions/$sessionId", "DELETE", accessToken, null) } catch (_: Throwable) {}
         prefs.edit().putString("activeAlbum", safeAlbum).apply()
-        syncStatus = "Added $added photos to '$safeAlbum'"
+        syncStatus = "Sync complete: $added added, $skipped already present/skipped, $failed failed"
         reloadAlbumPhotos(safeAlbum, pairPortraits)
     }
 
@@ -747,6 +783,7 @@ class MainActivity : Activity() {
                         val newAlbum = b.optString("activeAlbum", activeAlbum)
                         slideDurationSec = b.optInt("slideDurationSec", 20).coerceAtLeast(5)
                         pairPortraits = b.optBoolean("pairPortraitPhotos", true)
+                        shuffleSlides = b.optBoolean("shuffleSlides", true)
                         sleepStartHour = b.optInt("sleepStartHour", 23).coerceIn(0, 23)
                         wakeStartHour = b.optInt("wakeStartHour", 7).coerceIn(0, 23)
                         transition = b.optString("transition", "random")
@@ -758,6 +795,7 @@ class MainActivity : Activity() {
                         ed.putString("activeAlbum", newAlbum)
                         ed.putInt("slideDurationSec", slideDurationSec)
                         ed.putBoolean("pairPortraitPhotos", pairPortraits)
+                        ed.putBoolean("shuffleSlides", shuffleSlides)
                         ed.putInt("sleepStartHour", sleepStartHour)
                         ed.putInt("wakeStartHour", wakeStartHour)
                         ed.putString("transition", transition)
@@ -800,6 +838,7 @@ class MainActivity : Activity() {
             val pairChk = if (pairPortraits) "checked" else ""
             val clockChk = if (showClock) "checked" else ""
             val capChk = if (showCaption) "checked" else ""
+            val shuffleChk = if (shuffleSlides) "checked" else ""
             fun sel(v: String) = if (transition == v) "selected" else ""
             val opts = albums.joinToString("") { name ->
                 val count = File(getAlbumsRootDir(), name).listFiles { f -> f.name.endsWith(".jpg") && !f.name.endsWith("_blur.jpg") }?.size ?: 0
@@ -856,6 +895,7 @@ class MainActivity : Activity() {
                     <option value="zoom" ${sel("zoom")}>Zoom</option>
                 </select>
                 <label class="chk"><input type="checkbox" id="pair" $pairChk><span>Show 2 portrait photos side by side</span></label>
+                <label class="chk"><input type="checkbox" id="shuffle" $shuffleChk><span>Shuffle slideshow (avoid repeats between cycles)</span></label>
                 <label class="chk"><input type="checkbox" id="clk" $clockChk><span>Show clock, date and weather</span></label>
                 <label class="chk"><input type="checkbox" id="cap" $capChk><span>Show place and date on photos</span></label>
                 <label>Seconds per photo</label><input type="number" id="dur" value="$slideDurationSec">
@@ -915,6 +955,7 @@ class MainActivity : Activity() {
                             activeAlbum: document.getElementById('album').value,
                             transition: document.getElementById('tr').value,
                             pairPortraitPhotos: document.getElementById('pair').checked,
+                            shuffleSlides: document.getElementById('shuffle').checked,
                             showClock: document.getElementById('clk').checked,
                             showCaption: document.getElementById('cap').checked,
                             slideDurationSec: parseInt(document.getElementById('dur').value),
