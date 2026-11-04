@@ -8,6 +8,7 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.Geocoder
@@ -247,10 +248,18 @@ class MainActivity : Activity() {
         }
         bgExecutor.execute {
             try {
+                // Decode for the actual display area. Paired portraits each get half the
+                // screen width; a single photo gets the full screen dimensions.
+                val dm = resources.displayMetrics
+                val paired = slide.secondary != null
+                val targetW = if (paired) maxOf(1, dm.widthPixels / 2) else dm.widthPixels
+                val targetH = dm.heightPixels
                 val decoded = listOfNotNull(slide.primary, slide.secondary).map { p ->
-                    val reqW = if (p.isPortrait) 1000 else 1600
-                    val reqH = if (p.isPortrait) 1600 else 1000
-                    Decoded(p, decodeSampledBitmap(p.blurFile ?: p.file, 320, 180), decodeSampledBitmap(p.file, reqW, reqH))
+                    Decoded(
+                        p,
+                        decodeSampledBitmap(p.blurFile ?: p.file, 320, 180),
+                        decodeSampledBitmap(p.file, targetW, targetH)
+                    )
                 }
                 if (token != renderToken.get()) return@execute
                 mainHandler.post { if (token == renderToken.get()) showSlide(decoded) }
@@ -351,19 +360,8 @@ class MainActivity : Activity() {
             }
             pane.addView(iv, FrameLayout.LayoutParams(mp, mp))
 
-            // Paired portraits remain completely uncropped; single images get only a very subtle motion.
-            if (!paired) {
-                val a = ValueAnimator.ofFloat(1f, 1.025f)
-                a.duration = slideDurationSec * 1000L + 2000L
-                a.interpolator = LinearInterpolator()
-                a.addUpdateListener { v ->
-                    val scale = v.animatedValue as Float
-                    iv.scaleX = scale
-                    iv.scaleY = scale
-                }
-                a.start()
-                anims.add(a)
-            }
+            // Keep the complete photo visible. Avoid Ken Burns scaling here because even
+            // a subtle zoom can crop the edges of portraits and panoramic photographs.
         }
 
         if (showCaption) {
@@ -417,17 +415,63 @@ class MainActivity : Activity() {
         return try {
             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, options)
+            if (options.outWidth <= 0 || options.outHeight <= 0) return null
+
+            // Use the EXIF orientation to estimate the dimensions after rotation. This
+            // avoids undersampling portrait photos that are stored sideways in the file.
+            val orientation = try {
+                ExifInterface(file.absolutePath).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            } catch (_: Throwable) { ExifInterface.ORIENTATION_NORMAL }
+            val swaps = orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+                orientation == ExifInterface.ORIENTATION_TRANSVERSE ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_270
+            val displayW = if (swaps) options.outHeight else options.outWidth
+            val displayH = if (swaps) options.outWidth else options.outHeight
+
             var sample = 1
-            if (options.outHeight > reqHeight || options.outWidth > reqWidth) {
-                val halfH = options.outHeight / 2
-                val halfW = options.outWidth / 2
-                while ((halfH / sample) >= reqHeight && (halfW / sample) >= reqWidth) sample *= 2
+            while (displayW / (sample * 2) >= reqWidth &&
+                displayH / (sample * 2) >= reqHeight) {
+                sample *= 2
             }
-            val o = BitmapFactory.Options().apply {
+            val decodeOptions = BitmapFactory.Options().apply {
                 inSampleSize = sample
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
-            BitmapFactory.decodeFile(file.absolutePath, o)
+            val decoded = BitmapFactory.decodeFile(file.absolutePath, decodeOptions) ?: return null
+
+            // BitmapFactory does not apply EXIF orientation. Normalize all eight EXIF
+            // orientations before ImageView lays the image out with FIT_CENTER.
+            val matrix = Matrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.setScale(-1f, 1f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.setRotate(180f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.setScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    matrix.setRotate(90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.setRotate(90f)
+                ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    matrix.setRotate(-90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.setRotate(-90f)
+            }
+            if (orientation == ExifInterface.ORIENTATION_NORMAL ||
+                orientation == ExifInterface.ORIENTATION_UNDEFINED) {
+                decoded
+            } else {
+                try {
+                    Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+                        .also { if (it !== decoded) decoded.recycle() }
+                } catch (_: Throwable) {
+                    decoded
+                }
+            }
         } catch (_: Throwable) { null }
     }
 
@@ -488,14 +532,20 @@ class MainActivity : Activity() {
 
     private fun detectIsPortrait(file: File): Boolean {
         return try {
-            val exif = ExifInterface(file.absolutePath)
-            val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            val orientation = ExifInterface(file.absolutePath).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, opts)
-            val rot = orientation == ExifInterface.ORIENTATION_ROTATE_90 || orientation == ExifInterface.ORIENTATION_ROTATE_270
-            val w = if (rot) opts.outHeight else opts.outWidth
-            val h = if (rot) opts.outWidth else opts.outHeight
-            h > w
+            if (opts.outWidth <= 0 || opts.outHeight <= 0) return false
+            val swaps = orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+                orientation == ExifInterface.ORIENTATION_TRANSVERSE ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_270
+            val width = if (swaps) opts.outHeight else opts.outWidth
+            val height = if (swaps) opts.outWidth else opts.outHeight
+            height > width
         } catch (_: Throwable) { false }
     }
 
