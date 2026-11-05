@@ -70,7 +70,7 @@ class Decoded(
 )
 
 private const val PANO_RATIO = 1.5f   // photo is a panorama when this much wider than its pane
-private const val MAX_ZOOM = 1.6f     // max extra zoom beyond "fit" used to fill the pane
+private const val MAX_ZOOM = 1.8f     // max extra zoom beyond "fit" used to fill the pane
 
 /**
  * Fills its pane as much as possible without over-cropping:
