@@ -353,14 +353,12 @@ class MainActivity : Activity() {
         }
 
         d.fg?.let { f ->
-            // Smart Fill: use the frame/pane dimensions rather than forcing every photo
-            // into FIT_CENTER. Paired portraits and ordinary landscapes fill their pane;
-            // very wide panoramas and single portraits retain their full composition.
+            // Smart Fill: fill the available frame/pane for landscapes, panoramas,
+            // and paired portraits. Very wide images may lose some content at the sides.
+            // A single portrait keeps its full height with the blurred background behind it.
             val aspect = if (f.height > 0) f.width.toFloat() / f.height.toFloat() else 1f
             val scaleMode = when {
-                paired -> ImageView.ScaleType.CENTER_CROP
-                aspect >= 2.2f -> ImageView.ScaleType.FIT_CENTER // protect panoramas
-                aspect < 0.90f -> ImageView.ScaleType.FIT_CENTER // protect a single portrait
+                !paired && aspect < 0.90f -> ImageView.ScaleType.FIT_CENTER
                 else -> ImageView.ScaleType.CENTER_CROP
             }
             val iv = ImageView(this).apply {
