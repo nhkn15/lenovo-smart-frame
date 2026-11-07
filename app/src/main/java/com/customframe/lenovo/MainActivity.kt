@@ -296,10 +296,11 @@ class MainActivity : Activity() {
                 if (i == 1) {
                     wrapper.addView(View(this).apply { setBackgroundColor(Color.BLACK) }, LinearLayout.LayoutParams(gapPx, mp))
                 }
+				val paneWidth = if (paired) (sw - gapPx) / 2 else sw
                 wrapper.addView(
-                    createPane(d, if (paired) (sw - gapPx) / 2 else sw, sh, i == 0, anims, paired),
-                    LinearLayout.LayoutParams(0, mp, 1f)
-                )
+				createPane(d, paneWidth, sh, i == 0, anims, paired),
+				LinearLayout.LayoutParams(paneWidth, mp)
+			    )
             }
             wrapper.tag = anims
             slideContainer.addView(wrapper, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
