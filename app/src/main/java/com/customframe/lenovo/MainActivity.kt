@@ -9,6 +9,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.PointF
+import android.media.FaceDetector
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.Geocoder
@@ -21,6 +23,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
@@ -58,7 +61,73 @@ data class FramePhoto(
 
 data class SlideItem(val primary: FramePhoto, val secondary: FramePhoto? = null)
 
-class Decoded(val photo: FramePhoto, val bg: Bitmap?, val fg: Bitmap?)
+class Decoded(
+    val photo: FramePhoto,
+    val bg: Bitmap?,
+    val fg: Bitmap?,
+    val focusX: Float = 0.5f,
+    val focusY: Float = 0.42f
+)
+
+private const val PANO_RATIO = 1.5f   // a photo is a panorama when it is this much wider than its pane
+
+/**
+ * Sizes a photo using the view's real laid-out size (not guessed screen metrics):
+ *  - scale = min(fill, fit * maxZoom): fills edge to edge whenever the needed crop is within maxZoom
+ *  - crops toward the focus point (faces) instead of the center
+ *  - panoramas fill the height and pan across the whole photo when panning is on; with panning
+ *    off they use the same sizing mode as every other photo
+ */
+class SmartImageView(ctx: Context) : ImageView(ctx) {
+    var focusX = 0.5f
+    var focusY = 0.42f
+    var maxZoom = 2.0f
+    var panEnabled = true
+    var info = ""
+    var panProgress = 0f
+        set(v) { field = v; applyMatrix() }
+
+    init { scaleType = ImageView.ScaleType.MATRIX }
+
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        super.onLayout(changed, l, t, r, b)
+        applyMatrix()
+    }
+
+    fun applyMatrix() {
+        val d = drawable ?: return
+        val dw = d.intrinsicWidth.toFloat()
+        val dh = d.intrinsicHeight.toFloat()
+        val vw = (width - paddingLeft - paddingRight).toFloat()
+        val vh = (height - paddingTop - paddingBottom).toFloat()
+        if (dw <= 0f || dh <= 0f || vw <= 0f || vh <= 0f) return
+
+        val fit = minOf(vw / dw, vh / dh)
+        val fill = maxOf(vw / dw, vh / dh)
+        val pano = (dw / dh) > (vw / vh) * PANO_RATIO
+        val panning = pano && panEnabled
+        // Panning fills the height and drifts across the photo. Otherwise every photo,
+        // panoramas included, follows the sizing mode: fill, balanced, or whole photo.
+        val scale = if (panning) fill else minOf(fill, fit * maxZoom)
+        val sw = dw * scale
+        val sh = dh * scale
+        val tx = if (sw >= vw) {
+            val raw = if (panning) -(sw - vw) * panProgress else vw / 2f - focusX * sw
+            raw.coerceIn(vw - sw, 0f)
+        } else (vw - sw) / 2f
+        val ty = if (sh >= vh) (vh / 2f - focusY * sh).coerceIn(vh - sh, 0f) else (vh - sh) / 2f
+
+        val m = Matrix()
+        m.setScale(scale, scale)
+        m.postTranslate(tx, ty)
+        imageMatrix = m
+
+        info = String.format(java.util.Locale.US,
+            "img %dx%d  view %dx%d  zoom %.2fx of fit (max %.2f, needs %.2f)  %s",
+            dw.toInt(), dh.toInt(), vw.toInt(), vh.toInt(), scale / fit, maxZoom, fill / fit,
+            if (panning) "PAN" else if (sw >= vw - 1f && sh >= vh - 1f) "FILLS" else "BARS")
+    }
+}
 
 class MainActivity : Activity() {
 
@@ -83,6 +152,10 @@ class MainActivity : Activity() {
     @Volatile private var slideDurationSec = 20
     @Volatile private var pairPortraits = true
     @Volatile private var shuffleSlides = true
+    @Volatile private var panPanoramas = true
+    @Volatile private var fillMode = "fill"
+    @Volatile private var debugOverlay = false
+    private var panDirection = 0
     @Volatile private var sleepStartHour = 23
     @Volatile private var wakeStartHour = 7
     @Volatile private var transition = "random"
@@ -142,6 +215,9 @@ class MainActivity : Activity() {
         slideDurationSec = prefs.getInt("slideDurationSec", 20)
         pairPortraits = prefs.getBoolean("pairPortraitPhotos", true)
         shuffleSlides = prefs.getBoolean("shuffleSlides", true)
+        panPanoramas = prefs.getBoolean("panPanoramas", true)
+        fillMode = prefs.getString("fillMode", "fill") ?: "fill"
+        debugOverlay = prefs.getBoolean("debugOverlay", false)
         sleepStartHour = prefs.getInt("sleepStartHour", 23)
         wakeStartHour = prefs.getInt("wakeStartHour", 7)
         transition = prefs.getString("transition", "random") ?: "random"
@@ -255,10 +331,14 @@ class MainActivity : Activity() {
                 val targetW = if (paired) maxOf(1, dm.widthPixels / 2) else dm.widthPixels
                 val targetH = dm.heightPixels
                 val decoded = listOfNotNull(slide.primary, slide.secondary).map { p ->
+                    val fgBmp = decodeSampledBitmap(p.file, targetW, targetH)
+                    val focus = if (fgBmp != null) detectFocus(fgBmp, p.isPortrait) else Pair(0.5f, 0.42f)
                     Decoded(
                         p,
                         decodeSampledBitmap(p.blurFile ?: p.file, 320, 180),
-                        decodeSampledBitmap(p.file, targetW, targetH)
+                        fgBmp,
+                        focus.first,
+                        focus.second
                     )
                 }
                 if (token != renderToken.get()) return@execute
@@ -285,7 +365,7 @@ class MainActivity : Activity() {
             val sh = dm.heightPixels
             val paired = panes.size == 2
             val mp = LinearLayout.LayoutParams.MATCH_PARENT
-            val gapPx = if (paired) dp(14) else 0
+            val gapPx = if (paired) dp(4) else 0
 
             val wrapper = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -296,11 +376,11 @@ class MainActivity : Activity() {
                 if (i == 1) {
                     wrapper.addView(View(this).apply { setBackgroundColor(Color.BLACK) }, LinearLayout.LayoutParams(gapPx, mp))
                 }
-				val paneWidth = if (paired) (sw - gapPx) / 2 else sw
+                val paneWidth = if (paired) (sw - gapPx) / 2 else sw
                 wrapper.addView(
-				createPane(d, paneWidth, sh, i == 0, anims, paired),
-				LinearLayout.LayoutParams(paneWidth, mp)
-			    )
+                    createPane(d, paneWidth, sh, i == 0, anims, paired),
+                    LinearLayout.LayoutParams(0, mp, 1f)
+                )
             }
             wrapper.tag = anims
             slideContainer.addView(wrapper, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -354,19 +434,47 @@ class MainActivity : Activity() {
         }
 
         d.fg?.let { f ->
-            // Smart Fill: fill the available frame/pane for landscapes, panoramas,
-            // and paired portraits. Very wide images may lose some content at the sides.
-            // A single portrait keeps its full height with the blurred background behind it.
             val aspect = if (f.height > 0) f.width.toFloat() / f.height.toFloat() else 1f
-            val scaleMode = when {
-                !paired && aspect < 0.90f -> ImageView.ScaleType.FIT_CENTER
-                else -> ImageView.ScaleType.CENTER_CROP
-            }
-            val iv = ImageView(this).apply {
+            val canPan = panPanoramas && fillMode != "fit"
+            val iv = SmartImageView(this).apply {
                 setImageBitmap(f)
-                scaleType = scaleMode
+                focusX = d.focusX
+                focusY = d.focusY
+                panEnabled = canPan
+                maxZoom = when (fillMode) {
+                    "fit" -> 1.0f        // whole photo, blurred bars
+                    "balanced" -> 1.4f   // moderate crop
+                    else -> 3.5f         // fill the whole pane; only absurdly narrow shots keep slim bars
+                }
             }
             pane.addView(iv, FrameLayout.LayoutParams(mp, mp))
+
+            // Panorama: fill the height and drift across the whole photo, alternating direction
+            if (canPan && aspect > (pw.toFloat() / ph.toFloat()) * PANO_RATIO) {
+                val forward = (panDirection++ % 2 == 0)
+                iv.panProgress = if (forward) 0f else 1f
+                val a = ValueAnimator.ofFloat(if (forward) 0f else 1f, if (forward) 1f else 0f)
+                a.duration = slideDurationSec * 1000L + 800L
+                a.interpolator = AccelerateDecelerateInterpolator()
+                a.addUpdateListener { v -> iv.panProgress = v.animatedValue as Float }
+                a.start()
+                anims.add(a)
+            }
+
+            if (debugOverlay) {
+                val dbg = TextView(this).apply {
+                    setTextColor(Color.YELLOW)
+                    setBackgroundColor(0xAA000000.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setPadding(dp(6), dp(3), dp(6), dp(3))
+                }
+                pane.addView(dbg, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.START
+                ))
+                iv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> dbg.text = iv.info }
+            }
         }
 
         if (showCaption) {
@@ -405,6 +513,40 @@ class MainActivity : Activity() {
             }
         }
         return pane
+    }
+
+    // Where to center a crop: average position of detected faces, else a point slightly above center.
+    private fun detectFocus(bmp: Bitmap, portrait: Boolean): Pair<Float, Float> {
+        val defX = 0.5f
+        val defY = if (portrait) 0.36f else 0.45f
+        return try {
+            val s = minOf(1f, 320f / maxOf(bmp.width, bmp.height))
+            var w = (bmp.width * s).toInt()
+            if (w % 2 == 1) w -= 1
+            w = maxOf(w, 2)
+            val h = maxOf((bmp.height * s).toInt(), 2)
+            val scaled = Bitmap.createScaledBitmap(bmp, w, h, true)
+            val small = scaled.copy(Bitmap.Config.RGB_565, false)
+            if (scaled !== bmp) scaled.recycle()
+            if (small == null) return Pair(defX, defY)
+            val faces = arrayOfNulls<FaceDetector.Face>(6)
+            val n = FaceDetector(w, h, 6).findFaces(small, faces)
+            small.recycle()
+            var sx = 0f
+            var sy = 0f
+            var cnt = 0
+            for (i in 0 until n) {
+                val f = faces[i] ?: continue
+                if (f.confidence() < 0.4f) continue
+                val p = PointF()
+                f.getMidPoint(p)
+                sx += p.x
+                sy += p.y
+                cnt++
+            }
+            if (cnt == 0) Pair(defX, defY)
+            else Pair((sx / cnt / w).coerceIn(0.15f, 0.85f), (sy / cnt / h).coerceIn(0.15f, 0.85f))
+        } catch (_: Throwable) { Pair(defX, defY) }
     }
 
     private fun prettyDate(s: String): String {
@@ -596,7 +738,11 @@ class MainActivity : Activity() {
                         deck.add(SlideItem(portraits[i], portraits[i + 1]))
                         i += 2
                     }
-                    if (i < portraits.size) deck.add(SlideItem(portraits[i]))
+                    if (i < portraits.size) {
+                        val last = portraits[i]
+                        val partner = portraits.filter { it !== last }.randomOrNull()
+                        deck.add(if (partner != null) SlideItem(last, partner) else SlideItem(last))
+                    }
                     landscapes.forEach { deck.add(SlideItem(it)) }
                 }
 
@@ -705,7 +851,12 @@ class MainActivity : Activity() {
                 updateOnboardingText()
                 val createTime = item.optString("createTime", "")
                 val baseUrl = item.getJSONObject("mediaFile").getString("baseUrl")
-                val conn = (URL("$baseUrl=w1920-h1920").openConnection() as HttpURLConnection).apply {
+                val fileMeta = item.getJSONObject("mediaFile").optJSONObject("mediaFileMetadata")
+                val mw = fileMeta?.optInt("width", 0) ?: 0
+                val mh = fileMeta?.optInt("height", 0) ?: 0
+                val wide = mw > 0 && mh > 0 && maxOf(mw, mh).toFloat() / minOf(mw, mh).toFloat() > 2f
+                val sizeParam = if (wide) "w4096-h4096" else "w1920-h1920"
+                val conn = (URL("$baseUrl=$sizeParam").openConnection() as HttpURLConnection).apply {
                     setRequestProperty("Authorization", "Bearer $accessToken")
                     connectTimeout = 20000
                     readTimeout = 45000
@@ -842,6 +993,9 @@ class MainActivity : Activity() {
                         slideDurationSec = b.optInt("slideDurationSec", 20).coerceAtLeast(5)
                         pairPortraits = b.optBoolean("pairPortraitPhotos", true)
                         shuffleSlides = b.optBoolean("shuffleSlides", true)
+                        panPanoramas = b.optBoolean("panPanoramas", true)
+                        fillMode = b.optString("fillMode", "fill")
+                        debugOverlay = b.optBoolean("debugOverlay", false)
                         sleepStartHour = b.optInt("sleepStartHour", 23).coerceIn(0, 23)
                         wakeStartHour = b.optInt("wakeStartHour", 7).coerceIn(0, 23)
                         transition = b.optString("transition", "random")
@@ -854,6 +1008,9 @@ class MainActivity : Activity() {
                         ed.putInt("slideDurationSec", slideDurationSec)
                         ed.putBoolean("pairPortraitPhotos", pairPortraits)
                         ed.putBoolean("shuffleSlides", shuffleSlides)
+                        ed.putBoolean("panPanoramas", panPanoramas)
+                        ed.putString("fillMode", fillMode)
+                        ed.putBoolean("debugOverlay", debugOverlay)
                         ed.putInt("sleepStartHour", sleepStartHour)
                         ed.putInt("wakeStartHour", wakeStartHour)
                         ed.putString("transition", transition)
@@ -897,6 +1054,9 @@ class MainActivity : Activity() {
             val clockChk = if (showClock) "checked" else ""
             val capChk = if (showCaption) "checked" else ""
             val shuffleChk = if (shuffleSlides) "checked" else ""
+            val panChk = if (panPanoramas) "checked" else ""
+            val dbgChk = if (debugOverlay) "checked" else ""
+            fun fsel(v: String) = if (fillMode == v) "selected" else ""
             fun sel(v: String) = if (transition == v) "selected" else ""
             val opts = albums.joinToString("") { name ->
                 val count = File(getAlbumsRootDir(), name).listFiles { f -> f.name.endsWith(".jpg") && !f.name.endsWith("_blur.jpg") }?.size ?: 0
@@ -954,6 +1114,14 @@ class MainActivity : Activity() {
                 </select>
                 <label class="chk"><input type="checkbox" id="pair" $pairChk><span>Show 2 portrait photos side by side</span></label>
                 <label class="chk"><input type="checkbox" id="shuffle" $shuffleChk><span>Shuffle slideshow (avoid repeats between cycles)</span></label>
+                <label>Photo sizing</label>
+                <select id="fillMode">
+                    <option value="fill" ${fsel("fill")}>Fill screen (crop to fill every pane, follows faces)</option>
+                    <option value="balanced" ${fsel("balanced")}>Balanced (crop a little, keep some blur bars)</option>
+                    <option value="fit" ${fsel("fit")}>Show whole photo (blur bars)</option>
+                </select>
+                <label class="chk"><input type="checkbox" id="pan" $panChk><span>Slowly pan across panoramas (off in Show whole photo mode)</span></label>
+                <label class="chk"><input type="checkbox" id="dbg" $dbgChk><span>Show sizing debug text on screen</span></label>
                 <label class="chk"><input type="checkbox" id="clk" $clockChk><span>Show clock, date and weather</span></label>
                 <label class="chk"><input type="checkbox" id="cap" $capChk><span>Show place and date on photos</span></label>
                 <label>Seconds per photo</label><input type="number" id="dur" value="$slideDurationSec">
@@ -980,7 +1148,8 @@ class MainActivity : Activity() {
                         const b64 = await new Promise(function (res) {
                             const im = new Image();
                             im.onload = function () {
-                                const s = Math.min(1, 1920 / Math.max(im.width, im.height));
+                                const lim = (Math.max(im.width, im.height) / Math.min(im.width, im.height) > 2) ? 4096 : 1920;
+                                const s = Math.min(1, lim / Math.max(im.width, im.height));
                                 const c = document.createElement('canvas');
                                 c.width = Math.round(im.width * s); c.height = Math.round(im.height * s);
                                 c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
@@ -1014,6 +1183,9 @@ class MainActivity : Activity() {
                             transition: document.getElementById('tr').value,
                             pairPortraitPhotos: document.getElementById('pair').checked,
                             shuffleSlides: document.getElementById('shuffle').checked,
+                            fillMode: document.getElementById('fillMode').value,
+                            panPanoramas: document.getElementById('pan').checked,
+                            debugOverlay: document.getElementById('dbg').checked,
                             showClock: document.getElementById('clk').checked,
                             showCaption: document.getElementById('cap').checked,
                             slideDurationSec: parseInt(document.getElementById('dur').value),
