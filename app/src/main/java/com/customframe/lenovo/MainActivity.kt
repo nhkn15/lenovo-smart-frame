@@ -165,6 +165,30 @@ class MainActivity : Activity() {
     @Volatile private var lastKeyInfo = "none yet"
     @Volatile private var lastSensorInfo = "none yet"
     private var lastMotionMs = 0L
+    private var lastNavMs = 0L
+    private val keyLog = ArrayList<String>()
+
+    @Suppress("DEPRECATION")
+    private fun buildLabel(): String = try {
+        val pi = packageManager.getPackageInfo(packageName, 0)
+        "v${pi.versionName} (code ${pi.versionCode})"
+    } catch (_: Throwable) { "unknown" }
+
+    private fun logKey(kind: String, code: Int, e: KeyEvent?) {
+        val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        synchronized(keyLog) {
+            keyLog.add("$t $kind ${KeyEvent.keyCodeToString(code)} repeat=${e?.repeatCount ?: -1} device=${e?.deviceId ?: -1}")
+            while (keyLog.size > 12) keyLog.removeAt(0)
+        }
+    }
+
+    // Manual navigation (buttons, sensor, remote): move now, then restart the auto-advance countdown
+    private fun manualAdvance(delta: Int) {
+        lastNavMs = System.currentTimeMillis()
+        advanceSlide(delta)
+        mainHandler.removeCallbacks(slideRunnable)
+        mainHandler.postDelayed(slideRunnable, slideDurationSec * 1000L)
+    }
     private var sensorManager: SensorManager? = null
 
     // Remote control from other apps (Key Mapper "Send intent" -> Broadcast), e.g. action com.customframe.lenovo.NEXT
@@ -188,15 +212,15 @@ class MainActivity : Activity() {
             val now = System.currentTimeMillis()
             if (triggered && now - lastMotionMs > 1500L && !isSleepHour()) {
                 lastMotionMs = now
-                advanceSlide(1)
+                manualAdvance(1)
             }
         }
     }
 
     private fun handleControl(action: String) {
         when (action.uppercase(Locale.US)) {
-            "NEXT" -> mainHandler.post { advanceSlide(1) }
-            "PREV", "PREVIOUS" -> mainHandler.post { advanceSlide(-1) }
+            "NEXT" -> mainHandler.post { manualAdvance(1) }
+            "PREV", "PREVIOUS" -> mainHandler.post { manualAdvance(-1) }
             "PAUSE" -> isPaused = !isPaused
         }
     }
@@ -209,7 +233,9 @@ class MainActivity : Activity() {
                 arr.put("${s.name} | type=${s.type} | ${s.stringType} | maxRange=${s.maximumRange}")
             }
         } catch (_: Throwable) {}
+        val keys = synchronized(keyLog) { ArrayList(keyLog) }
         return JSONObject().put("sensors", arr).put("lastSensorEvent", lastSensorInfo).put("lastKey", lastKeyInfo)
+            .put("recentKeys", org.json.JSONArray(keys)).put("paused", isPaused).put("build", buildLabel())
     }
 
     private fun startSensors() {
@@ -393,7 +419,7 @@ class MainActivity : Activity() {
         mainHandler.post {
             if (slides.isEmpty()) {
                 statusOverlayText.visibility = View.VISIBLE
-                statusOverlayText.text = "Lenovo Smart Frame\n\nOpen http://${getLocalIpAddress()}:8080 on your phone or PC to add photos\n\nStatus: $syncStatus"
+                statusOverlayText.text = "Lenovo Smart Frame ${buildLabel()}\n\nOpen http://${getLocalIpAddress()}:8080 on your phone or PC to add photos\n\nStatus: $syncStatus"
             } else {
                 statusOverlayText.visibility = View.GONE
             }
@@ -709,12 +735,22 @@ class MainActivity : Activity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         lastKeyInfo = "$keyCode ${KeyEvent.keyCodeToString(keyCode)}"
+        logKey("DOWN", keyCode, event)
+        val first = event?.repeatCount == 0
         return when (keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP -> { if (event?.repeatCount == 0) advanceSlide(1); true }
-            KeyEvent.KEYCODE_VOLUME_DOWN -> { if (event?.repeatCount == 0) advanceSlide(-1); true }
-            KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_NEXT -> { advanceSlide(1); true }
-            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> { advanceSlide(-1); true }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> { isPaused = !isPaused; true }
+            KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                if (first) manualAdvance(1)
+                true
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                if (first) manualAdvance(-1)
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                // Ignore a stray pause key arriving right after +/- (some frame buttons send extra keys)
+                if (first && System.currentTimeMillis() - lastNavMs > 1000L) isPaused = !isPaused
+                true
+            }
             else -> super.onKeyDown(keyCode, event)
         }
     }
@@ -1124,8 +1160,8 @@ class MainActivity : Activity() {
 
                     session.uri == "/api/control" && session.method == Method.POST -> {
                         when (parseBody(session).optString("action")) {
-                            "NEXT" -> mainHandler.post { advanceSlide(1) }
-                            "PREV" -> mainHandler.post { advanceSlide(-1) }
+                            "NEXT" -> mainHandler.post { manualAdvance(1) }
+                            "PREV" -> mainHandler.post { manualAdvance(-1) }
                             "PAUSE" -> isPaused = !isPaused
                         }
                         newFixedLengthResponse(Response.Status.OK, "application/json", """{"status":"ok"}""")
@@ -1179,6 +1215,7 @@ class MainActivity : Activity() {
                 .ok { color: #34d399; font-size: 13px; }
             </style></head><body>
             <h2>Smart Frame &middot; ${getLocalIpAddress()}</h2>
+            <p style="color:#9ca3af;font-size:13px;margin-top:-8px;">Build ${buildLabel()}</p>
             <div class="card"><div class="row">
                 <button onclick="cmd('PREV')">&#9198; Prev</button>
                 <button onclick="cmd('PAUSE')">&#9199; Pause</button>
@@ -1306,7 +1343,7 @@ class MainActivity : Activity() {
                     const r = await fetch('/api/sensors');
                     const d = await r.json();
                     document.getElementById('sens').innerText =
-                        'Last key: ' + d.lastKey + '\nLast sensor event: ' + d.lastSensorEvent + '\n\n' + d.sensors.join('\n');
+                        'Build: ' + d.build + '\nPaused: ' + d.paused + '\n\nRecent keys:\n' + d.recentKeys.join('\n') + '\n\nLast sensor event: ' + d.lastSensorEvent + '\n\n' + d.sensors.join('\n');
                 }
                 async function cmd(action) { await fetch('/api/control', { method: 'POST', body: JSON.stringify({ action: action }) }); }
             </script></body></html>
