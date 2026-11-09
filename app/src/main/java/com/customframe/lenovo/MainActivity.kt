@@ -2,7 +2,13 @@ package com.customframe.lenovo
 
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.IntentFilter
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Bitmap
@@ -155,6 +161,74 @@ class MainActivity : Activity() {
     @Volatile private var panPanoramas = true
     @Volatile private var fillMode = "fill"
     @Volatile private var debugOverlay = false
+    @Volatile private var motionAction = "off"   // off | next
+    @Volatile private var lastKeyInfo = "none yet"
+    @Volatile private var lastSensorInfo = "none yet"
+    private var lastMotionMs = 0L
+    private var sensorManager: SensorManager? = null
+
+    // Remote control from other apps (Key Mapper "Send intent" -> Broadcast), e.g. action com.customframe.lenovo.NEXT
+    private val controlReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            handleControl(i?.action?.substringAfterLast('.') ?: "")
+        }
+    }
+
+    private val sensorListener = object : SensorEventListener {
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        override fun onSensorChanged(e: SensorEvent) {
+            val vals = e.values.joinToString(",") { String.format(Locale.US, "%.1f", it) }
+            lastSensorInfo = "${e.sensor.name} [$vals]"
+            if (motionAction != "next") return
+            val triggered = if (e.sensor.type == Sensor.TYPE_PROXIMITY) {
+                e.values.isNotEmpty() && e.values[0] < e.sensor.maximumRange
+            } else {
+                e.values.any { it != 0f }
+            }
+            val now = System.currentTimeMillis()
+            if (triggered && now - lastMotionMs > 1500L && !isSleepHour()) {
+                lastMotionMs = now
+                advanceSlide(1)
+            }
+        }
+    }
+
+    private fun handleControl(action: String) {
+        when (action.uppercase(Locale.US)) {
+            "NEXT" -> mainHandler.post { advanceSlide(1) }
+            "PREV", "PREVIOUS" -> mainHandler.post { advanceSlide(-1) }
+            "PAUSE" -> isPaused = !isPaused
+        }
+    }
+
+    private fun sensorSummary(): JSONObject {
+        val arr = org.json.JSONArray()
+        try {
+            val sm = sensorManager ?: (getSystemService(Context.SENSOR_SERVICE) as SensorManager)
+            for (s in sm.getSensorList(Sensor.TYPE_ALL)) {
+                arr.put("${s.name} | type=${s.type} | ${s.stringType} | maxRange=${s.maximumRange}")
+            }
+        } catch (_: Throwable) {}
+        return JSONObject().put("sensors", arr).put("lastSensorEvent", lastSensorInfo).put("lastKey", lastKeyInfo)
+    }
+
+    private fun startSensors() {
+        try {
+            val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            sensorManager = sm
+            for (s in sm.getSensorList(Sensor.TYPE_ALL)) {
+                val t = (s.stringType ?: "").lowercase(Locale.US)
+                val n = s.name.lowercase(Locale.US)
+                val looksRight = s.type == Sensor.TYPE_PROXIMITY ||
+                    t.contains("gesture") || n.contains("gesture") ||
+                    t.contains("proximity") || n.contains("wave") ||
+                    n.contains("presence") || n.contains("swipe") || n.contains("hand")
+                if (looksRight && s.reportingMode != Sensor.REPORTING_MODE_ONE_SHOT) {
+                    sm.registerListener(sensorListener, s, SensorManager.SENSOR_DELAY_NORMAL)
+                }
+            }
+        } catch (_: Throwable) {}
+    }
     private var panDirection = 0
     @Volatile private var sleepStartHour = 23
     @Volatile private var wakeStartHour = 7
@@ -218,6 +292,7 @@ class MainActivity : Activity() {
         panPanoramas = prefs.getBoolean("panPanoramas", true)
         fillMode = prefs.getString("fillMode", "fill") ?: "fill"
         debugOverlay = prefs.getBoolean("debugOverlay", false)
+        motionAction = prefs.getString("motionAction", "off") ?: "off"
         sleepStartHour = prefs.getInt("sleepStartHour", 23)
         wakeStartHour = prefs.getInt("wakeStartHour", 7)
         transition = prefs.getString("transition", "random") ?: "random"
@@ -238,6 +313,14 @@ class MainActivity : Activity() {
             }
         }
 
+        try {
+            val f = IntentFilter()
+            f.addAction("com.customframe.lenovo.NEXT")
+            f.addAction("com.customframe.lenovo.PREV")
+            f.addAction("com.customframe.lenovo.PAUSE")
+            registerReceiver(controlReceiver, f)
+        } catch (_: Throwable) {}
+        startSensors()
         mainHandler.post(clockRunnable)
         mainHandler.post(weatherRunnable)
         mainHandler.postDelayed(slideRunnable, slideDurationSec * 1000L)
@@ -251,6 +334,8 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         mainHandler.removeCallbacksAndMessages(null)
+        try { sensorManager?.unregisterListener(sensorListener) } catch (_: Throwable) {}
+        try { unregisterReceiver(controlReceiver) } catch (_: Throwable) {}
         try { webServer?.stop() } catch (_: Throwable) {}
     }
 
@@ -623,7 +708,10 @@ class MainActivity : Activity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        lastKeyInfo = "$keyCode ${KeyEvent.keyCodeToString(keyCode)}"
         return when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> { if (event?.repeatCount == 0) advanceSlide(1); true }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> { if (event?.repeatCount == 0) advanceSlide(-1); true }
             KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_NEXT -> { advanceSlide(1); true }
             KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> { advanceSlide(-1); true }
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> { isPaused = !isPaused; true }
@@ -996,6 +1084,7 @@ class MainActivity : Activity() {
                         panPanoramas = b.optBoolean("panPanoramas", true)
                         fillMode = b.optString("fillMode", "fill")
                         debugOverlay = b.optBoolean("debugOverlay", false)
+                        motionAction = b.optString("motionAction", "off")
                         sleepStartHour = b.optInt("sleepStartHour", 23).coerceIn(0, 23)
                         wakeStartHour = b.optInt("wakeStartHour", 7).coerceIn(0, 23)
                         transition = b.optString("transition", "random")
@@ -1011,6 +1100,7 @@ class MainActivity : Activity() {
                         ed.putBoolean("panPanoramas", panPanoramas)
                         ed.putString("fillMode", fillMode)
                         ed.putBoolean("debugOverlay", debugOverlay)
+                        ed.putString("motionAction", motionAction)
                         ed.putInt("sleepStartHour", sleepStartHour)
                         ed.putInt("wakeStartHour", wakeStartHour)
                         ed.putString("transition", transition)
@@ -1023,6 +1113,14 @@ class MainActivity : Activity() {
                         reloadAlbumPhotos(newAlbum, pairPortraits)
                         newFixedLengthResponse(Response.Status.OK, "application/json", """{"status":"ok"}""")
                     }
+
+                    session.uri == "/api/control" && session.method == Method.GET -> {
+                        handleControl(session.parms["action"] ?: "")
+                        newFixedLengthResponse(Response.Status.OK, "application/json", """{"status":"ok"}""")
+                    }
+
+                    session.uri == "/api/sensors" && session.method == Method.GET ->
+                        newFixedLengthResponse(Response.Status.OK, "application/json", sensorSummary().toString())
 
                     session.uri == "/api/control" && session.method == Method.POST -> {
                         when (parseBody(session).optString("action")) {
@@ -1057,6 +1155,7 @@ class MainActivity : Activity() {
             val panChk = if (panPanoramas) "checked" else ""
             val dbgChk = if (debugOverlay) "checked" else ""
             fun fsel(v: String) = if (fillMode == v) "selected" else ""
+            fun msel(v: String) = if (motionAction == v) "selected" else ""
             fun sel(v: String) = if (transition == v) "selected" else ""
             val opts = albums.joinToString("") { name ->
                 val count = File(getAlbumsRootDir(), name).listFiles { f -> f.name.endsWith(".jpg") && !f.name.endsWith("_blur.jpg") }?.size ?: 0
@@ -1122,6 +1221,13 @@ class MainActivity : Activity() {
                 </select>
                 <label class="chk"><input type="checkbox" id="pan" $panChk><span>Slowly pan across panoramas (off in Show whole photo mode)</span></label>
                 <label class="chk"><input type="checkbox" id="dbg" $dbgChk><span>Show sizing debug text on screen</span></label>
+                <label>Motion / gesture sensor</label>
+                <select id="motion">
+                    <option value="off" ${msel("off")}>Off</option>
+                    <option value="next" ${msel("next")}>Wave to show next photo</option>
+                </select>
+                <button onclick="showSensors()">Show sensors and last key pressed</button>
+                <pre id="sens" style="white-space:pre-wrap;font-size:12px;color:#9ca3af;"></pre>
                 <label class="chk"><input type="checkbox" id="clk" $clockChk><span>Show clock, date and weather</span></label>
                 <label class="chk"><input type="checkbox" id="cap" $capChk><span>Show place and date on photos</span></label>
                 <label>Seconds per photo</label><input type="number" id="dur" value="$slideDurationSec">
@@ -1186,6 +1292,7 @@ class MainActivity : Activity() {
                             fillMode: document.getElementById('fillMode').value,
                             panPanoramas: document.getElementById('pan').checked,
                             debugOverlay: document.getElementById('dbg').checked,
+                            motionAction: document.getElementById('motion').value,
                             showClock: document.getElementById('clk').checked,
                             showCaption: document.getElementById('cap').checked,
                             slideDurationSec: parseInt(document.getElementById('dur').value),
@@ -1194,6 +1301,12 @@ class MainActivity : Activity() {
                         })
                     });
                     if (reload) location.reload();
+                }
+                async function showSensors() {
+                    const r = await fetch('/api/sensors');
+                    const d = await r.json();
+                    document.getElementById('sens').innerText =
+                        'Last key: ' + d.lastKey + '\nLast sensor event: ' + d.lastSensorEvent + '\n\n' + d.sensors.join('\n');
                 }
                 async function cmd(action) { await fetch('/api/control', { method: 'POST', body: JSON.stringify({ action: action }) }); }
             </script></body></html>
