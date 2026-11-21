@@ -157,7 +157,9 @@ class MainActivity : Activity() {
     @Volatile private var activeAlbum = "Default"
     @Volatile private var slideDurationSec = 20
     @Volatile private var pairPortraits = true
-    @Volatile private var shuffleSlides = true
+    @Volatile private var sortMode = "auto" // auto | shuffle | newest | throwback
+    @Volatile private var activeSortMode = "shuffle"
+    @Volatile private var photoLibrary: List<FramePhoto> = emptyList()
     @Volatile private var panPanoramas = true
     @Volatile private var fillMode = "fill"
     @Volatile private var debugOverlay = false
@@ -314,7 +316,8 @@ class MainActivity : Activity() {
         activeAlbum = prefs.getString("activeAlbum", "Default") ?: "Default"
         slideDurationSec = prefs.getInt("slideDurationSec", 20)
         pairPortraits = prefs.getBoolean("pairPortraitPhotos", true)
-        shuffleSlides = prefs.getBoolean("shuffleSlides", true)
+        sortMode = prefs.getString("sortMode", "auto") ?: "auto"
+        if (sortMode !in listOf("auto", "shuffle", "newest", "throwback")) sortMode = "auto"
         panPanoramas = prefs.getBoolean("panPanoramas", true)
         fillMode = prefs.getString("fillMode", "fill") ?: "fill"
         debugOverlay = prefs.getBoolean("debugOverlay", false)
@@ -758,16 +761,113 @@ class MainActivity : Activity() {
     private fun advanceSlide(delta: Int) {
         val size = slides.size
         if (size == 0) return
-        if (delta > 0 && currentIndex >= size - 1 && shuffleSlides && size > 1) {
-            val previous = slides[currentIndex]
-            val nextDeck = slides.shuffled().toMutableList()
-            if (nextDeck.first() == previous) Collections.swap(nextDeck, 0, 1)
-            slides = nextDeck
-            currentIndex = 0
-        } else {
-            currentIndex = ((currentIndex + delta) % size + size) % size
+
+        // Auto Cycle changes modes only after a complete forward pass through the deck.
+        if (delta > 0 && currentIndex >= size - 1) {
+            when (sortMode) {
+                "auto" -> {
+                    advanceAutoCycle()
+                    return
+                }
+                "shuffle" -> {
+                    val previous = slides[currentIndex]
+                    val nextDeck = buildSlideDeck(photoLibrary, "shuffle", pairPortraits).toMutableList()
+                    if (nextDeck.size > 1 && nextDeck.first() == previous) {
+                        Collections.swap(nextDeck, 0, 1)
+                    }
+                    if (nextDeck.isNotEmpty()) {
+                        slides = nextDeck
+                        currentIndex = 0
+                        renderCurrentSlide()
+                        return
+                    }
+                }
+            }
         }
+
+        currentIndex = ((currentIndex + delta) % size + size) % size
         renderCurrentSlide()
+    }
+
+    private fun advanceAutoCycle() {
+        val modes = listOf("shuffle", "newest", "throwback")
+        val current = modes.indexOf(activeSortMode).let { if (it < 0) 0 else it }
+        val previousSlide = slides.lastOrNull()
+        for (step in 1..modes.size) {
+            val candidate = modes[(current + step) % modes.size]
+            val nextDeck = buildSlideDeck(photoLibrary, candidate, pairPortraits).toMutableList()
+            if (nextDeck.size > 1 && nextDeck.first() == previousSlide) {
+                Collections.swap(nextDeck, 0, 1)
+            }
+            if (nextDeck.isNotEmpty()) {
+                activeSortMode = candidate
+                slides = nextDeck
+                currentIndex = 0
+                syncStatus = "Auto Cycle: ${sortModeLabel(candidate)}"
+                renderCurrentSlide()
+                return
+            }
+        }
+        // Defensive fallback: the library may have changed while cycling.
+        activeSortMode = "shuffle"
+        slides = buildSlideDeck(photoLibrary, "shuffle", pairPortraits)
+        currentIndex = 0
+        renderCurrentSlide()
+    }
+
+    private fun sortModeLabel(mode: String): String = when (mode) {
+        "shuffle" -> "Shuffle"
+        "newest" -> "Newest First"
+        "throwback" -> "Throwback"
+        else -> "Auto Cycle"
+    }
+
+    private fun photoDate(raw: String): Date? {
+        if (raw.isBlank() || raw.length < 10) return null
+        return try {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }
+                .parse(raw.take(10).replace(':', '-'))
+        } catch (_: Throwable) { null }
+    }
+
+    private fun isThrowbackPhoto(photo: FramePhoto): Boolean {
+        val taken = photoDate(photo.dateTaken) ?: return false
+        val takenCal = Calendar.getInstance().apply { time = taken }
+        val today = Calendar.getInstance()
+        return takenCal.get(Calendar.YEAR) < today.get(Calendar.YEAR) &&
+            takenCal.get(Calendar.MONTH) == today.get(Calendar.MONTH) &&
+            takenCal.get(Calendar.DAY_OF_MONTH) == today.get(Calendar.DAY_OF_MONTH)
+    }
+
+    private fun buildSlideDeck(
+        photos: List<FramePhoto>,
+        mode: String,
+        pairMode: Boolean
+    ): List<SlideItem> {
+        val ordered = when (mode) {
+            "newest" -> photos.sortedByDescending { photoDate(it.dateTaken)?.time ?: Long.MIN_VALUE }
+            "throwback" -> photos.filter { isThrowbackPhoto(it) }
+                .sortedByDescending { photoDate(it.dateTaken)?.time ?: Long.MIN_VALUE }
+            else -> photos.shuffled()
+        }
+
+        val deck = mutableListOf<SlideItem>()
+        if (!pairMode) {
+            ordered.forEach { deck.add(SlideItem(it)) }
+            return deck
+        }
+
+        val portraits = ordered.filter { it.isPortrait }
+        val landscapes = ordered.filter { !it.isPortrait }
+        var i = 0
+        while (i + 1 < portraits.size) {
+            deck.add(SlideItem(portraits[i], portraits[i + 1]))
+            i += 2
+        }
+        // Keep an odd final portrait as a single-photo slide; don't reuse another photo.
+        if (i < portraits.size) deck.add(SlideItem(portraits[i]))
+        landscapes.forEach { deck.add(SlideItem(it)) }
+        return deck
     }
 
     private fun isSleepHour(): Boolean {
@@ -847,33 +947,23 @@ class MainActivity : Activity() {
                     // Always inspect the actual image. Older cached metadata can contain
                     // an incorrect portrait flag from earlier app versions.
                     FramePhoto(file, if (blur.exists()) blur else null, dateStr, locStr, detectIsPortrait(file))
-                }.shuffled()
-
-                // Build slides: pair every two confirmed portrait images; keep landscapes full-screen.
-                val deck = mutableListOf<SlideItem>()
-                val portraitCount = loaded.count { it.isPortrait }
-                if (!pairMode) {
-                    loaded.forEach { deck.add(SlideItem(it)) }
-                } else {
-                    val portraits = loaded.filter { it.isPortrait }
-                    val landscapes = loaded.filter { !it.isPortrait }
-                    var i = 0
-                    while (i + 1 < portraits.size) {
-                        deck.add(SlideItem(portraits[i], portraits[i + 1]))
-                        i += 2
-                    }
-                    if (i < portraits.size) {
-                        val last = portraits[i]
-                        val partner = portraits.filter { it !== last }.randomOrNull()
-                        deck.add(if (partner != null) SlideItem(last, partner) else SlideItem(last))
-                    }
-                    landscapes.forEach { deck.add(SlideItem(it)) }
                 }
 
-                val pairCount = if (pairMode) portraitCount / 2 else 0
-                syncStatus = "Loaded ${loaded.size} photos; detected $portraitCount portraits; created $pairCount two-photo slides."
+                val portraitCount = loaded.count { it.isPortrait }
+                photoLibrary = loaded
                 activeAlbum = safeName
-                slides = if (shuffleSlides) deck.shuffled() else deck.toList()
+                val requestedMode = if (sortMode == "auto") "shuffle" else sortMode
+                var effectiveMode = requestedMode
+                var deck = buildSlideDeck(loaded, effectiveMode, pairMode)
+                if (deck.isEmpty() && effectiveMode == "throwback" && loaded.isNotEmpty()) {
+                    effectiveMode = "newest"
+                    deck = buildSlideDeck(loaded, effectiveMode, pairMode)
+                    syncStatus = "No Throwback photos for today; showing Newest First."
+                } else {
+                    syncStatus = "Loaded ${loaded.size} photos; detected $portraitCount portraits. ${sortModeLabel(sortMode)}."
+                }
+                activeSortMode = effectiveMode
+                slides = deck
                 currentIndex = 0
                 renderCurrentSlide()
             } catch (_: Throwable) {}
@@ -1116,7 +1206,8 @@ class MainActivity : Activity() {
                         val newAlbum = b.optString("activeAlbum", activeAlbum)
                         slideDurationSec = b.optInt("slideDurationSec", 20).coerceAtLeast(5)
                         pairPortraits = b.optBoolean("pairPortraitPhotos", true)
-                        shuffleSlides = b.optBoolean("shuffleSlides", true)
+                        sortMode = b.optString("sortMode", sortMode)
+                        if (sortMode !in listOf("auto", "shuffle", "newest", "throwback")) sortMode = "auto"
                         panPanoramas = b.optBoolean("panPanoramas", true)
                         fillMode = b.optString("fillMode", "fill")
                         debugOverlay = b.optBoolean("debugOverlay", false)
@@ -1132,7 +1223,7 @@ class MainActivity : Activity() {
                         ed.putString("activeAlbum", newAlbum)
                         ed.putInt("slideDurationSec", slideDurationSec)
                         ed.putBoolean("pairPortraitPhotos", pairPortraits)
-                        ed.putBoolean("shuffleSlides", shuffleSlides)
+                        ed.putString("sortMode", sortMode)
                         ed.putBoolean("panPanoramas", panPanoramas)
                         ed.putString("fillMode", fillMode)
                         ed.putBoolean("debugOverlay", debugOverlay)
@@ -1187,7 +1278,7 @@ class MainActivity : Activity() {
             val pairChk = if (pairPortraits) "checked" else ""
             val clockChk = if (showClock) "checked" else ""
             val capChk = if (showCaption) "checked" else ""
-            val shuffleChk = if (shuffleSlides) "checked" else ""
+            fun sortSel(v: String) = if (sortMode == v) "selected" else ""
             val panChk = if (panPanoramas) "checked" else ""
             val dbgChk = if (debugOverlay) "checked" else ""
             fun fsel(v: String) = if (fillMode == v) "selected" else ""
@@ -1249,7 +1340,13 @@ class MainActivity : Activity() {
                     <option value="zoom" ${sel("zoom")}>Zoom</option>
                 </select>
                 <label class="chk"><input type="checkbox" id="pair" $pairChk><span>Show 2 portrait photos side by side</span></label>
-                <label class="chk"><input type="checkbox" id="shuffle" $shuffleChk><span>Shuffle slideshow (avoid repeats between cycles)</span></label>
+                <label>Slideshow order</label>
+                <select id="sortMode">
+                    <option value="auto" ${sortSel("auto")}>Auto Cycle (Shuffle, Newest First, Throwback)</option>
+                    <option value="shuffle" ${sortSel("shuffle")}>Shuffle (reshuffle after each full cycle)</option>
+                    <option value="newest" ${sortSel("newest")}>Newest First</option>
+                    <option value="throwback" ${sortSel("throwback")}>Throwback (same month and day in prior years)</option>
+                </select>
                 <label>Photo sizing</label>
                 <select id="fillMode">
                     <option value="fill" ${fsel("fill")}>Fill screen (crop to fill every pane, follows faces)</option>
@@ -1325,7 +1422,7 @@ class MainActivity : Activity() {
                             activeAlbum: document.getElementById('album').value,
                             transition: document.getElementById('tr').value,
                             pairPortraitPhotos: document.getElementById('pair').checked,
-                            shuffleSlides: document.getElementById('shuffle').checked,
+                            sortMode: document.getElementById('sortMode').value,
                             fillMode: document.getElementById('fillMode').value,
                             panPanoramas: document.getElementById('pan').checked,
                             debugOverlay: document.getElementById('dbg').checked,
